@@ -1,136 +1,296 @@
+import os
 from flask import Flask, jsonify, request, make_response
 from models.Alumno import Alumno
 from models.Profesor import Profesor
+from database import db
+from s3_handler import upload_file_to_s3
+from sns_handler import publish_message_to_sns
+from dotenv import load_dotenv
+from dynamodb_handler import create_session, get_session, deactivate_session
 
-app = Flask(__name__)
+load_dotenv()
 
-db_alumnos = []
-db_profesores = []
+def create_app():
+    app = Flask(__name__)
 
-# Helper para forzar JSON y códigos de estado limpios
-def responder_json(data, status):
-    return make_response(jsonify(data), status)
+    db_user = os.getenv("DB_USER")
+    db_password = os.getenv("DB_PASSWORD")
+    db_host = os.getenv("DB_HOST")
+    db_port = os.getenv("DB_PORT")
+    db_name = os.getenv("DB_NAME")
 
-# ==========================================
-# ENDPOINTS ALUMNOS
-# ==========================================
+    app.config["SQLALCHEMY_DATABASE_URI"] = (
+        f"mysql+pymysql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+    )
+    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
-@app.route('/alumnos', methods=['GET'])
-def get_alumnos():
-    # El test espera Content-Type: application/json (jsonify lo hace)
-    return responder_json([a.to_dict() for a in db_alumnos], 200)
+    db.init_app(app)
 
-@app.route('/alumnos/<int:id>', methods=['GET'])
-def get_alumno(id):
-    alumno = next((a for a in db_alumnos if a.id == id), None)
-    if alumno:
+    def responder_json(data, status):
+        return make_response(jsonify(data), status)
+
+    def get_json_body():
+        data = request.get_json(silent=True)
+        if not data:
+            return None, responder_json({"error": "Body vacío"}, 400)
+        return data, None
+
+    #---- ALUMNOS ------------------------------
+
+    @app.route("/alumnos", methods=["GET"])
+    def get_alumnos():
+        alumnos = Alumno.query.all()
+        return responder_json([a.to_dict() for a in alumnos], 200)
+
+    @app.route("/alumnos/<int:id>", methods=["GET"])
+    def get_alumno(id):
+        alumno = db.session.get(Alumno, id)
+        if not alumno:
+            return responder_json({"error": "No encontrado"}, 404)
         return responder_json(alumno.to_dict(), 200)
-    return responder_json({"error": "No encontrado"}, 404)
 
-@app.route('/alumnos', methods=['POST'])
-def post_alumno():
-    data = request.get_json()
-    if not data:
-        return responder_json({"error": "Body vacío"}, 400)
+    @app.route("/alumnos", methods=["POST"])
+    def post_alumno():
+        data, error_response = get_json_body()
+        if error_response:
+            return error_response
+
+        es_valido, error = Alumno.validar(data)
+        if not es_valido:
+            return responder_json({"error": error}, 400)
+
+        nuevo = Alumno(
+            nombres=data["nombres"],
+            apellidos=data["apellidos"],
+            matricula=data["matricula"],
+            promedio=data["promedio"],
+            password=data["password"],
+        )
+
+        try:
+            db.session.add(nuevo)
+            db.session.commit()
+            return responder_json(nuevo.to_dict(), 201)
+        except Exception:
+            db.session.rollback()
+            return responder_json({"error": "Error al guardar en la base de datos"}, 500)
+
+    @app.route("/alumnos/<int:id>", methods=["PUT"])
+    def put_alumno(id):
+        data, error_response = get_json_body()
+        if error_response:
+            return error_response
+
+        alumno = db.session.get(Alumno, id)
+        if not alumno:
+            return responder_json({"error": "No encontrado"}, 404)
+
+        es_valido, error = Alumno.validar(data)
+        if not es_valido:
+            return responder_json({"error": error}, 400)
+
+        try:
+            alumno.nombres = data["nombres"]
+            alumno.apellidos = data["apellidos"]
+            alumno.matricula = data["matricula"]
+            alumno.promedio = data["promedio"]
+            alumno.password = data["password"]
+            alumno.fotoPerfilUrl = data.get("fotoPerfilUrl")
+
+            db.session.commit()
+            return responder_json(alumno.to_dict(), 200)
+        except Exception:
+            db.session.rollback()
+            return responder_json({"error": "Error al actualizar el alumno"}, 500)
+
+    @app.route("/alumnos/<int:id>", methods=["DELETE"])
+    def delete_alumno(id):
+        alumno = db.session.get(Alumno, id)
+        if not alumno:
+            return responder_json({"error": "No encontrado"}, 404)
+
+        try:
+            db.session.delete(alumno)
+            db.session.commit()
+            return responder_json({"mensaje": "Eliminado"}, 200)
+        except Exception:
+            db.session.rollback()
+            return responder_json({"error": "Error al eliminar el alumno"}, 500)
+
+    @app.route("/alumnos/<int:id>/fotoPerfil", methods=["POST"])
+    def post_alumno_foto(id):
+        alumno = db.session.get(Alumno, id)
+        if not alumno:
+            return responder_json({"error": "No encontrado"}, 404)
+
+        file = request.files.get("foto")
+        if not file:
+            return responder_json({"error": "No se proporcionó ningún archivo"}, 400)
+
+        url = upload_file_to_s3(file, id)
+        if not url:
+            return responder_json({"error": "Error al subir archivo"}, 500)
+
+        try:
+            alumno.fotoPerfilUrl = url
+            db.session.commit()
+            return responder_json(alumno.to_dict(), 200)
+        except Exception:
+            db.session.rollback()
+            return responder_json({"error": "Error al guardar la URL de la foto"}, 500)
+
+    @app.route("/alumnos/<int:id>/email", methods=["POST"])
+    def post_alumno_mail(id):
+        alumno = db.session.get(Alumno, id)
+        if not alumno:
+            return responder_json({"error": "No encontrado"}, 404)
+        
+        mensaje = f"Registro de alumno:\nNombre: {alumno.nombres} {alumno.apellidos}\nMatrícula: {alumno.matricula}\nPromedio: {alumno.promedio}"
+        topic = "Registro de alumno"
+
+        exito = publish_message_to_sns(mensaje, topic)
+        if not exito:
+            return responder_json({"error": "Error al enviar mensaje"}, 500)
+        
+        return responder_json({"mensaje": "Mensaje enviado"}, 200)
+
+    @app.route("/alumnos/<int:id>/session/login", methods=["POST"])
+    def login_alumno(id):
+        alumno = db.session.get(Alumno, id)
+        if not alumno:
+            return responder_json({"error": "No encontrado"}, 404)
+
+        data, error_response = get_json_body()
+        if error_response:
+            return error_response
+
+        password = data.get("password")
+        if not password:
+            return responder_json({"error": "Falta el campo 'password'"}, 400)
+
+        #debería regresar 401 si la contraseña es incorrecta, pero para no revelar que el alumno existe o no, se regresa 401 tanto para alumno no encontrado como para contraseña incorrecta
+        if password != alumno.password:
+            return responder_json({"error": "Contraseña incorrecta"}, 400)
+
+        session_string = create_session(id)
+        return responder_json({"sessionString": session_string}, 200)
     
-    es_valido, error = Alumno.validar(data)
-    if not es_valido:
-        return responder_json({"error": error}, 400)
+    @app.route("/alumnos/<int:id>/session/verify", methods=["POST"])
+    def verify_session(id):
+        data, error_response = get_json_body()
+        if error_response:
+            return error_response
+
+        session_string = data.get("sessionString")
+        if not session_string:
+            return responder_json({"error": "Falta el campo 'sessionString'"}, 400)
+
+        session = get_session(session_string)
+        if not session or not session.get("active") or session.get("alumnoID") != id:
+            return responder_json({"error": "Sesión inválida"}, 400)
+
+        return responder_json({"mensaje": "Sesión válida"}, 200)
     
-    # EL TEST MANDA SU PROPIO ID
-    nuevo = Alumno(data['id'], data['nombres'], data['apellidos'], 
-                   data['matricula'], data['promedio'])
-    db_alumnos.append(nuevo)
-    return responder_json(nuevo.to_dict(), 201)
+    @app.route("/alumnos/<int:id>/session/logout", methods=["POST"])
+    def logout_alumno(id):
+        data, error_response = get_json_body()
+        if error_response:
+            return error_response
 
-@app.route('/alumnos/<int:id>', methods=['PUT'])
-def put_alumno(id):
-    data = request.get_json()
-    alumno = next((a for a in db_alumnos if a.id == id), None)
-    if not alumno:
-        return responder_json({"error": "No encontrado"}, 404)
-    
-    es_valido, error = Alumno.validar(data)
-    if not es_valido:
-        return responder_json({"error": error}, 400)
+        session_string = data.get("sessionString")
+        if not session_string:
+            return responder_json({"error": "Falta el campo 'sessionString'"}, 400)
 
-    alumno.nombres = data['nombres']
-    alumno.apellidos = data['apellidos']
-    alumno.matricula = data['matricula']
-    alumno.promedio = data['promedio']
-    return responder_json(alumno.to_dict(), 200)
+        session = get_session(session_string)
+        if not session or session.get("alumnoID") != id:
+            return responder_json({"error": "Sesión inválida"}, 401)
 
-@app.route('/alumnos/<int:id>', methods=['DELETE'])
-def delete_alumno(id):
-    global db_alumnos
-    alumno = next((a for a in db_alumnos if a.id == id), None)
-    if not alumno:
-        return responder_json({"error": "No encontrado"}, 404)
-    
-    db_alumnos = [a for a in db_alumnos if a.id != id]
-    return responder_json({"mensaje": "Eliminado"}, 200)
+        deactivate_session(session_string)
+        return responder_json({"mensaje": "Sesión cerrada"}, 200)
 
-# ==========================================
-# ENDPOINTS PROFESORES
-# ==========================================
 
-@app.route('/profesores', methods=['GET'])
-def get_profesores():
-    return responder_json([p.__dict__ for p in db_profesores], 200)
+    # ---- PROFESORES ------------------------------
 
-@app.route('/profesores/<int:id>', methods=['GET'])
-def get_profesor(id):
-    profesor = next((p for p in db_profesores if p.id == id), None)
-    if profesor:
+    @app.route("/profesores", methods=["GET"])
+    def get_profesores():
+        profesores = Profesor.query.all()
+        return responder_json([p.to_dict() for p in profesores], 200)
+
+    @app.route("/profesores/<int:id>", methods=["GET"])
+    def get_profesor(id):
+        profesor = db.session.get(Profesor, id)
+        if not profesor:
+            return responder_json({"error": "No encontrado"}, 404)
         return responder_json(profesor.to_dict(), 200)
-    return responder_json({"error": "No encontrado"}, 404)
 
-@app.route('/profesores', methods=['POST'])
-def post_profesor():
-    data = request.get_json()
-    if not data:
-        return responder_json({"error": "Body vacío"}, 400)
-    
-    es_valido, error = Profesor.validar(data)
-    if not es_valido:
-        return responder_json({"error": error}, 400)
-    
-    nuevo = Profesor(data['id'], data['numeroEmpleado'], data['nombres'], 
-                     data['apellidos'], data['horasClase'])
-    db_profesores.append(nuevo)
-    return responder_json(nuevo.to_dict(), 201)
+    @app.route("/profesores", methods=["POST"])
+    def post_profesor():
+        data, error_response = get_json_body()
+        if error_response:
+            return error_response
 
-@app.route('/profesores/<int:id>', methods=['PUT'])
-def put_profesor(id):
-    data = request.get_json()
-    profesor = next((p for p in db_profesores if p.id == id), None)
-    if not profesor:
-        return responder_json({"error": "No encontrado"}, 404)
-    
-    es_valido, error = Profesor.validar(data)
-    if not es_valido:
-        return responder_json({"error": error}, 400)
+        es_valido, error = Profesor.validar(data)
+        if not es_valido:
+            return responder_json({"error": error}, 400)
 
-    profesor.numeroEmpleado = data['numeroEmpleado']
-    profesor.nombres = data['nombres']
-    profesor.apellidos = data['apellidos']
-    profesor.horasClase = data['horasClase']
-    return responder_json(profesor.to_dict(), 200)
+        nuevo = Profesor(
+            numeroEmpleado=data["numeroEmpleado"],
+            nombres=data["nombres"],
+            apellidos=data["apellidos"],
+            horasClase=data["horasClase"]
+        )
 
-@app.route('/profesores/<int:id>', methods=['DELETE'])
-def delete_profesor(id):
-    global db_profesores
-    profesor = next((p for p in db_profesores if p.id == id), None)
-    if not profesor:
-        return responder_json({"error": "No encontrado"}, 404)
-    
-    db_profesores = [p for p in db_profesores if p.id != id]
-    return responder_json({"mensaje": "Eliminado"}, 200)
+        try:
+            db.session.add(nuevo)
+            db.session.commit()
+            return responder_json(nuevo.to_dict(), 201)
+        except Exception:
+            db.session.rollback()
+            return responder_json({"error": "Error al guardar en la base de datos"}, 500)
 
-# ==========================================
-# RUN
-# ==========================================    
+    @app.route("/profesores/<int:id>", methods=["PUT"])
+    def put_profesor(id):
+        data, error_response = get_json_body()
+        if error_response:
+            return error_response
 
-if __name__ == '__main__':
-    # Importante: host 0.0.0.0 para AWS
-    app.run(host='0.0.0.0', port=5000)
+        profesor = db.session.get(Profesor, id)
+        if not profesor:
+            return responder_json({"error": "No encontrado"}, 404)
+
+        es_valido, error = Profesor.validar(data)
+        if not es_valido:
+            return responder_json({"error": error}, 400)
+
+        try:
+            profesor.numeroEmpleado = data["numeroEmpleado"]
+            profesor.nombres = data["nombres"]
+            profesor.apellidos = data["apellidos"]
+            profesor.horasClase = data["horasClase"]
+
+            db.session.commit()
+            return responder_json(profesor.to_dict(), 200)
+        except Exception:
+            db.session.rollback()
+            return responder_json({"error": "Error al actualizar el profesor"}, 500)
+
+    @app.route("/profesores/<int:id>", methods=["DELETE"])
+    def delete_profesor(id):
+        profesor = db.session.get(Profesor, id)
+        if not profesor:
+            return responder_json({"error": "No encontrado"}, 404)
+
+        try:
+            db.session.delete(profesor)
+            db.session.commit()
+            return responder_json({"mensaje": "Eliminado"}, 200)
+        except Exception:
+            db.session.rollback()
+            return responder_json({"error": "Error al eliminar el profesor"}, 500)
+
+    return app
+
+app = create_app()
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
